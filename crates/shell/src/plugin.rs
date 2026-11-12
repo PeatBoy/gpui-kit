@@ -45,6 +45,7 @@ use serde::Deserialize;
 use crate::{
     capability::{Capabilities, ExecuteGrant, HttpRequestGrant},
     engine::ShellRuntime,
+    host_modules::HostModule,
     policy::Policy,
     root::ShellRoot,
     runtime::failure_surface,
@@ -1382,6 +1383,7 @@ fn load_plugin(
     manifest: PluginManifest,
     root: PathBuf,
     data_dir: PathBuf,
+    host_modules: &[HostModule],
     window: &mut Window,
     cx: &mut App,
 ) -> Result<Plugin> {
@@ -1394,16 +1396,18 @@ fn load_plugin(
         );
     }
 
-    let policy = Rc::new(
-        Policy::default()
-            // The manifest id is already unique among loaded plugins, which is
-            // exactly what a dock layout needs to keep two plugins' panels of
-            // the same name apart.
-            .with_application(&id)
-            .with_capabilities(manifest.capabilities(&root, &data_dir))
-            .with_data_dir(data_dir.clone())
-            .with_storage_path(store_path.clone()),
-    );
+    let mut policy = Policy::default()
+        // The manifest id is already unique among loaded plugins, which is
+        // exactly what a dock layout needs to keep two plugins' panels of the
+        // same name apart.
+        .with_application(&id)
+        .with_capabilities(manifest.capabilities(&root, &data_dir))
+        .with_data_dir(data_dir.clone())
+        .with_storage_path(store_path.clone());
+    for module in host_modules {
+        policy = policy.with_host_module(module.clone())?;
+    }
+    let policy = Rc::new(policy);
 
     let view = load_view_with_policy(runtime, &root, manifest.entry(), policy.clone(), window, cx)
         .with_context(|| format!("loading application `{id}`"))?;
@@ -1604,6 +1608,12 @@ pub struct PluginManager {
     catalog: Vec<CatalogEntry>,
     discovered: bool,
     loaded: BTreeMap<String, Plugin>,
+    /// The host functions every plugin this manager loads may import.
+    ///
+    /// Per-manager rather than global: the host chose this list, so the list is
+    /// the grant. A host that needs different modules per plugin can build one
+    /// manager per policy; the common case is one list for the whole host.
+    host_modules: Vec<HostModule>,
 }
 
 struct CatalogEntry {
@@ -1622,6 +1632,7 @@ impl PluginManager {
             catalog: Vec::new(),
             discovered: false,
             loaded: BTreeMap::new(),
+            host_modules: Vec::new(),
         }
     }
 
@@ -1630,6 +1641,31 @@ impl PluginManager {
     pub fn with_data_home(mut self, path: PathBuf) -> Self {
         self.data_home = path;
         self
+    }
+
+    /// Adds one HostModule every plugin loaded by this manager may import.
+    ///
+    /// The module is installed into the plugin's own [`Policy`] when that
+    /// plugin is loaded, so one manager's modules are not reachable from a
+    /// plugin loaded by another manager. The module's name must not belong to
+    /// the runtime; validation happens here, where the host still holds the
+    /// error.
+    pub fn with_host_module(mut self, module: HostModule) -> Result<Self, crate::HostError> {
+        module.validate()?;
+        self.host_modules.push(module);
+        Ok(self)
+    }
+
+    /// Adds several HostModules at once.
+    pub fn with_host_modules(
+        mut self,
+        modules: impl IntoIterator<Item = HostModule>,
+    ) -> Result<Self, crate::HostError> {
+        for module in modules {
+            module.validate()?;
+            self.host_modules.push(module);
+        }
+        Ok(self)
     }
 
     pub fn directories(&self) -> &[PathBuf] {
@@ -1730,7 +1766,15 @@ impl PluginManager {
         }
         let root = entry.root.clone();
         let data_dir = self.data_dir(id);
-        let plugin = load_plugin(runtime, manifest, root, data_dir, window, cx)?;
+        let plugin = load_plugin(
+            runtime,
+            manifest,
+            root,
+            data_dir,
+            &self.host_modules,
+            window,
+            cx,
+        )?;
         self.loaded.insert(id.to_owned(), plugin);
 
         Ok(())
@@ -2326,6 +2370,48 @@ mod tests {
             runtime.entities().is_empty(),
             "unload must drop the input record and its GPUI subscriptions"
         );
+    }
+
+    #[gpui::test]
+    fn a_plugin_can_import_a_manager_host_module(cx: &mut TestAppContext) {
+        let plugins = TempTree::new("host-module");
+        let data = TempTree::new("host-module-data");
+        let manifest = r#"{
+            "id": "com.example.host-module",
+            "name": "Host module",
+            "entry": "main.js"
+        }"#;
+        let root = plugins.plugin("host-module", manifest);
+        std::fs::write(
+            root.join("main.js"),
+            r#"
+                import { div, View } from "gpui-kit";
+                import { ping } from "vibex";
+                export default class Panel extends View {
+                  render(cx) { return div().child(ping()); }
+                }
+            "#,
+        )
+        .expect("write script");
+
+        cx.update(crate::init);
+        let runtime = ShellRuntime::new_isolated().expect("runtime");
+        cx.update(|cx| runtime.set_global(cx));
+        let window = cx.add_window(|_, _| Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let module = crate::HostModule::new("vibex")
+            .function("ping", |_| Ok(crate::HostValue::from("pong")));
+        let mut manager = PluginManager::new(vec![plugins.path().to_path_buf()])
+            .with_data_home(data.path().to_path_buf())
+            .with_host_module(module)
+            .expect("host module");
+        assert!(manager.discover().iter().all(Result::is_ok));
+
+        context
+            .update(|window, cx| {
+                manager.load(&runtime, "com.example.host-module", |_| true, window, cx)
+            })
+            .expect("a plugin must be able to import the manager's host module");
     }
 
     #[gpui::test]
